@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+
+import React, { useState, useEffect } from 'react'
 import dayjs from 'dayjs';
 import { useParams } from 'react-router-dom';
 import { ToastContainer, toast } from 'react-toastify';
@@ -16,6 +17,8 @@ import {
   Typography,
 } from '@mui/material';
 import styled from '@emotion/styled';
+import { addAttendanceParallel } from '../../ParallelBackend/parallelBackendApi';
+
 
 import {
   useAddAttendanceMutation,
@@ -25,10 +28,13 @@ import { CardWrapper } from '../../../Components/CardWrapper';
 import Loading from '../../../Components/Loading';
 import Error from '../../../Components/Error';
 
+import * as faceapi from 'face-api.js';
+import axios from 'axios';
+
+
 const StyledButton = styled(Button)(() => ({
   color: '#4e73df',
-  fontWeight: '600',
-  variant: 'contained',
+  fontWeight: '600'
 }));
 
 export const Attendance = () => {
@@ -50,6 +56,28 @@ export const Attendance = () => {
   // For attendance
   const [attendance, setAttendance] = useState([]);
 
+  const [groupPhoto, setGroupPhoto] = useState(null);
+const [modelsLoaded, setModelsLoaded] = useState(false);
+
+useEffect(() => {
+  const loadModels = async () => {
+    try {
+      const MODEL_URL = '/models';
+      await Promise.all([
+        faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
+        faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+      ]);
+      setModelsLoaded(true);
+      console.log('Face-api models loaded');
+    } catch (e) {
+      console.error('Error loading face-api models', e);
+      toast.error('Failed to load face models');
+    }
+  };
+  loadModels();
+}, []);
+
   // Handling Present or Absent
   const handleRadioChange = (index, value) => {
     const updatedAttendance = [...attendance];
@@ -62,6 +90,94 @@ export const Attendance = () => {
     const status = attendance[index];
     return status === 'Present' ? '#4e73df' : 'red';
   };
+
+  const euclideanDistance = (a, b) => {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const diff = a[i] - b[i];
+    sum += diff * diff;
+  }
+  return Math.sqrt(sum);
+};
+
+const findBestMatch = (descriptor, studentsWithDescriptor, threshold = 0.6) => {
+  let bestStudent = null;
+  let bestDistance = Infinity;
+  studentsWithDescriptor.forEach((stu) => {
+    if (!stu.faceDescriptor || !stu.faceDescriptor.length) return;
+    const dist = euclideanDistance(descriptor, stu.faceDescriptor);
+    if (dist < bestDistance) {
+      bestDistance = dist;
+      bestStudent = stu;
+    }
+  });
+  if (bestStudent && bestDistance <= threshold) {
+    return bestStudent;
+  }
+  return null;
+};
+
+const handleFaceBasedAttendance = async () => {
+  console.log('classId from params:', classId);
+
+  try {
+    if (!modelsLoaded) {
+      toast.error('Face models not loaded yet.');
+      return;
+    }
+    if (!groupPhoto) {
+      toast.error('Please upload a group photo first.');
+      return;
+    }
+    if (!students || students.length === 0) {
+      toast.error('No students found for this class.');
+      return;
+    }
+
+    // 1) Load image into HTMLImageElement
+    const img = await faceapi.bufferToImage(groupPhoto);
+
+    // 2) Detect all faces with descriptors
+    const results = await faceapi
+      .detectAllFaces(img)
+      .withFaceLandmarks()
+      .withFaceDescriptors();
+
+    if (!results || results.length === 0) {
+      toast.error('No faces detected in group photo.');
+      return;
+    }
+    console.log('Detected faces:', results.length);
+
+    // 3) Get students with descriptors from parallel DB
+    const res = await axios.get('http://10.219.78.147:5050/students', {
+      params: { classId },
+    });
+    const parallelStudents = res.data || []; // expect array of {classId,id,name,...,faceDescriptor}
+
+    // 4) For each detected face, find best match
+    const autoAttendance = Array(students.length).fill('Absent'); // base: all absent
+
+    results.forEach((det) => {
+      const descriptor = Array.from(det.descriptor);
+      const matched = findBestMatch(descriptor, parallelStudents);
+      if (matched) {
+        // find index in current students list
+        const idx = students.findIndex((s) => s.id === matched.id);
+        if (idx !== -1) {
+          autoAttendance[idx] = 'Present';
+        }
+      }
+    });
+
+    setAttendance(autoAttendance);
+    toast.success('Auto attendance marked from photo. Review and submit.');
+  } catch (e) {
+    console.error('Face-based attendance failed:', e);
+    toast.error('Failed to mark attendance from photo.');
+  }
+};
+
 
   // Clear the Attendance sheet
   const handleClearAttendance = () => {
@@ -108,11 +224,22 @@ export const Attendance = () => {
   };
 
   const Attndnce = (data) => {
-    addAttendance({ classId: classId, data })
-      .unwrap()
-      .then((response) => toast.success(response.message))
-      .catch((error) => toast.error(error.error || error.data.error.message));
-  };
+  // 1) Existing backend call (unchanged)
+  addAttendance({ classId: classId, data })
+    .unwrap()
+    .then((response) => toast.success(response.message))
+    .catch((error) => toast.error(error.error || error.data.error.message));
+
+  // 2) NEW: Parallel backend call (silent)
+  addAttendanceParallel(classId, data)
+    .then(() => {
+      // optional: console.log('Parallel attendance stored');
+    })
+    .catch((e) => {
+      console.warn('Parallel backend (attendance) failed:', e?.message || e);
+    });
+};
+
 
   //  Handling Page Display
   let content;
@@ -191,7 +318,20 @@ export const Attendance = () => {
               ))}
             </TableBody>
           </Table>
-          <Box mt={2} display='flex' justifyContent='space-between'>
+          <Box mt={2} display='flex' flexDirection='column' gap={2}>
+          {/* Photo input */}
+          <Box display='flex' justifyContent='space-between' alignItems='center'>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setGroupPhoto(e.target.files[0])}
+            />
+            <StyledButton variant='outlined' onClick={handleFaceBasedAttendance}>
+              Mark via Photo
+            </StyledButton>
+          </Box>
+
+          <Box display='flex' justifyContent='space-between'>
             <StyledButton variant='outlined' onClick={handleAllPresent}>
               All Present
             </StyledButton>
@@ -202,6 +342,7 @@ export const Attendance = () => {
               Clear All
             </StyledButton>
           </Box>
+        </Box>
         </Box>
       </CardWrapper>
     );
